@@ -163,10 +163,10 @@ It is explained in *Chapter perf*.As CPU profiling is critical for application a
 The following uses `perf(1)` to sample stack traces (-g) across all CPUs (-a) at 49 Hertz (-F 49: samples per second) for 30 seconds, and then to list the samples:
 
 ```shell
-# perf record -F 49 -a -g -- sleep 30
+perf record -F 49 -a -g -- sleep 30
 [ perf record: Woken up 1 times to write data ]
 [ perf record: Captured and wrote 0.560 MB perf.data (2940 samples) ]
-# perf script
+perf script
 mysqld 10441 [000] 64918.205722:   10101010 cpu-clock:pppH:
         5587b59bf2f0 row_mysql_store_col_in_innobase_format+0x270 (/usr/sbin/mysqld)
         5587b59c3951 [unknown] (/usr/sbin/mysqld)
@@ -188,3 +188,231 @@ mysqld 10441 [000] 64918.205722:   10101010 cpu-clock:pppH:
 There are 2,940 stack samples in this profile; only one stack has been included here.\
 The `perf(1)` script subcommand prints each stack sample in a previously recorded profile (the perf.data file).\
 `perf(1)` also has a report subcommand for summarizing the profile as a code-path hierarchy. The profile can also be visualized as a CPU flame graph.
+
+### Syscall Tracing
+
+The `perf(1)` trace subcommand traces system calls by default,and is `perf(1)`’s version of `strace(1)` .\
+For example, tracing a MySQL server process:
+
+```shell
+perf trace -p $(pgrep mysqld)
+         ? (         ): mysqld/10120  ... [continued]: futex())
+= -1 ETIMEDOUT (Connection timed out)
+     0.014 ( 0.002 ms): mysqld/10120 futex(uaddr: 0x7fbddc37ed48, op: WAKE|
+PRIVATE_FLAG, val: 1)           = 0
+     0.023 (10.103 ms): mysqld/10120 futex(uaddr: 0x7fbddc37ed98, op: WAIT_BITSET|
+PRIVATE_FLAG, utime: 0x7fbdc9cfcbc0, val3: MATCH_ANY) = -1 ETIMEDOUT (Connection
+timed out)
+[...]
+```
+
+### Kernel Time Analysis
+
+As `perf(1)` trace shows time in syscalls, it helps explain the system CPU time commonly shown by monitoring tools,\
+although it is easier to start with a summary than the event-by-event output. `perf(1)` trace summarizes syscalls with `-s`:
+
+```shell
+# perf trace -s -p $(pgrep mysqld)
+ mysqld (14169), 225186 events, 99.1%
+
+   syscall            calls    total       min       avg       max      stddev
+                               (msec)    (msec)    (msec)    (msec)        (%)
+   --------------- -------- --------- --------- --------- ---------     ------
+   sendto             27239   267.904     0.002     0.010     0.109      0.28%
+   recvfrom           69861   212.213     0.001     0.003     0.069      0.23%
+   ppoll              15478   201.183     0.002     0.013     0.412      0.75%
+
+[...]
+```
+
+The output shows syscall counts and timing for each thread.\
+The earlier output showing `futex(2)` calls is not very interesting in isolation, and running `perf(1)` trace on any busy application will produce an avalanche of output.\
+It helps to start with this summary first, and then to use `perf(1)` trace with a filter to inspect only the syscall types of interest.
+
+### I/O Profiling
+
+I/O syscalls are particularly interesting, and some were seen in the previous output.\
+Tracing the `sendto(2)` calls using a filter `(-e)`:
+
+```shell
+perf trace -e sendto -p $(pgrep mysqld)
+     0.000 ( 0.015 ms): mysqld/14097 sendto(fd: 37<socket:[833323]>, buff:
+0x7fbdac072040, len: 12664, flags: DONTWAIT) = 12664
+     0.451 ( 0.019 ms): mysqld/14097 sendto(fd: 37<socket:[833323]>, buff:
+0x7fbdac072040, len: 12664, flags: DONTWAIT) = 12664
+     0.624 ( 0.011 ms): mysqld/14097 sendto(fd: 37<socket:[833323]>, buff:
+0x7fbdac072040, len: 11, flags: DONTWAIT) = 11
+     0.788 ( 0.010 ms): mysqld/14097 sendto(fd: 37<socket:[833323]>, buff:
+0x7fbdac072040, len: 11, flags: DONTWAIT) = 11
+[...]
+```
+
+The output shows two 12664-byte sends followed by two 11-byte sends, all with the DONTWAIT flag.\
+If I saw a flood of small sends, I might wonder if performance could be improved by coalescing them, or avoiding the DONTWAIT flag.\
+While `perf(1)` trace can be used for some I/O profiling, I often wish to dig further into the arguments and summarize them in custom ways.\
+For example, this `sendto(2)` trace shows the file descriptor (37) and socket number (833323), but I’d rather see the socket type, IP addresses, and ports.\
+For such custom tracing, you can switch to bpftrace in Section bpftrace.
+
+## profile
+
+`profile(8)` is timer-based CPU profiler from BCC (See: Chapter BCC).\
+It uses BPF to reduce overhead by aggregating stack traces in kernel context, and only passes unique stacks and their counts to user space.\
+The following `profile(8)` example samples at 49 Hertz across all CPUs, for 10 seconds:
+
+```shell
+profile -F 49 10
+Sampling at 49 Hertz of all threads by user + kernel stack for 10 secs.
+[...]
+
+    SELECT_LEX::prepare(THD*)
+    Sql_cmd_select::prepare_inner(THD*)
+    Sql_cmd_dml::prepare(THD*)
+    Sql_cmd_dml::execute(THD*)
+    mysql_execute_command(THD*, bool)
+    Prepared_statement::execute(String*, bool)
+    Prepared_statement::execute_loop(String*, bool)
+    mysqld_stmt_execute(THD*, Prepared_statement*, bool, unsigned long, PS_PARAM*)
+    dispatch_command(THD*, COM_DATA const*, enum_server_command)
+    do_command(THD*)
+    [unknown]
+    [unknown]
+    start_thread
+    -                mysqld (10106)
+        13
+```
+
+Only one stack trace is included in this output, showing that SELECT_LEX::prepare() was sampled on-CPU with that ancestry 13 times.\
+`profile(8)` is further discussed in Chapter CPUs, which lists its various options and includes instructions for generating CPU flame graphs from its output.
+
+## offcputime
+
+`offcputime(8)` is a BCC and bpftrace tool (Chapter 15) to summarize time spent by threads blocked and off-CPU, showing stack traces to explain why.\
+It supports Off-CPU analysis. `offcputime(8)` is the counterpart to `profile(8)`: between them, they show the entire time spent by threads on the system.\
+The following shows `offcputime(8)` from BCC, tracing for 5 seconds:
+
+```shell
+offcputime 5
+Tracing off-CPU time (us) of all threads by user + kernel stack for 5 secs.
+[...]
+
+    finish_task_switch
+    schedule
+    jbd2_log_wait_commit
+    jbd2_complete_transaction
+    ext4_sync_file
+    vfs_fsync_range
+    do_fsync
+    __x64_sys_fdatasync
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    fdatasync
+    IO_CACHE_ostream::sync()
+    MYSQL_BIN_LOG::sync_binlog_file(bool)
+    MYSQL_BIN_LOG::ordered_commit(THD*, bool, bool)
+    MYSQL_BIN_LOG::commit(THD*, bool)
+    ha_commit_trans(THD*, bool, bool)
+    trans_commit(THD*, bool)
+    mysql_execute_command(THD*, bool)
+    Prepared_statement::execute(String*, bool)
+    Prepared_statement::execute_loop(String*, bool)
+    mysqld_stmt_execute(THD*, Prepared_statement*, bool, unsigned long, PS_PARAM*)
+    dispatch_command(THD*, COM_DATA const*, enum_server_command)
+    do_command(THD*)
+    [unknown]
+    [unknown]
+    start_thread
+    -                mysqld (10441)
+        352107
+
+[...]
+```
+
+The output shows unique stack traces and their time spent off-CPU in microseconds.\
+This particular stack shows `ext4` file system sync operations via a code path through `MYSQL_BIN_LOG::sync_binlog_file()`, totaling 352 milliseconds during this trace.\
+For efficiency, `offcputime(8)` aggregates these stacks in kernel context, and emits only unique stacks to user space.\
+It also only records stack traces for off-CPU durations that exceed a threshold, one microsecond by default, which can be tuned using the `-m` option.\
+There is also a `-M` option to set the maximum time for recording stacks.Why would we want to exclude long-duration stacks?\\
+This can be an effective way to filter out uninteresting stacks: threads waiting for work and blocking for one or more seconds in a loop. Try using `-M 900000`, to exclude durations longer than 900 ms.
+
+### Off-CPU Time Flame Graphs
+
+Despite only showing unique stacks, the full output from the previous example was still over 200,000 lines.\
+To make sense of it, it can be visualized as an off-CPU time flame graph. The commands to generate these are similar to those with `profile(8)`:
+
+```shell
+git clone https://github.com/brendangregg/FlameGraph; cd FlameGraph
+offcputime -f 5 | ./flamegraph.pl --bgcolors=blue --title="Off-CPU Time Flame Graph"> out.svg
+```
+
+## strace
+
+The `strace(1)` command is the Linux system call tracer.\
+It can trace syscalls, printing a one-line summary for each, and can also count syscalls and print a report.\\
+
+______________________________________________________________________
+
+Syscall tracers for other operating systems are: BSD has `ktrace(1)`, Solaris has `truss(1)`, OS X has `dtruss(1)`, and Windows has a number of options including `logger.exe` and `ProcMon`.\
+For example, tracing syscalls by PID 1884:
+
+```shell
+strace -ttt -T -p 1884
+
+1356982510.395542 close(3)              = 0 <0.000267>
+1356982510.396064 close(4)              = 0 <0.000293>
+1356982510.396617 ioctl(255, TIOCGPGRP, [1975]) = 0 <0.000019>
+1356982510.396980 rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0 <0.000024>
+1356982510.397288 rt_sigprocmask(SIG_BLOCK, [CHLD], [], 8) = 0 <0.000014>
+1356982510.397365 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WSTOPPED|
+WCONTINUED, NULL) = 1975 <0.018187>
+[...]
+```
+
+- `-ttt`: Prints the first column of time-since-epoch, in units of seconds with microsecond resolution.
+- `-T`: Prints the last field (<time>), which is the duration of the system call, in units of seconds with microsecond resolution.
+- `-p PID`: Trace this process ID. A command can also be specified so that `strace(1)` launches and traces it.
+
+Other options not used here include `-f` to follow child threads, and `-o` filename to write the strace(1) output to the given file name.\
+A feature of `strace(1)` can be seen in the output—translation of syscall arguments into a human-readable form.\
+This is especially useful for understanding `ioctl(2)` calls.\
+The `-c` option can be used to summarize system call activity.\
+The following example also invokes and traces a command (`dd(1)`) rather than attaching to a PID:
+
+```shell
+strace -c dd if=/dev/zero of=/dev/null bs=1k count=5000k
+
+5120000+0 records in
+5120000+0 records out
+5242880000 bytes (5.2 GB) copied, 140.722 s, 37.3 MB/s
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 51.46    0.008030           0   5120005           read
+ 48.54    0.007574           0   5120003           write
+  0.00    0.000000           0        20        13 open
+[...]
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.015604              10240092        19 total
+```
+
+The output begins with three lines from `dd(1)` followed by the `strace(1)` summary. The columns are:
+
+- time: Percentage showing where system CPU time was spent
+- seconds: Total system CPU time, in seconds
+- usecs/call: Average system CPU time per call, in microseconds
+- calls: Number of system calls
+- syscall: System call name
+
+### strace Overhead
+
+The current version of `strace(1)` employs breakpoint-based tracing via the Linux `ptrace(2)` interface.\
+This sets breakpoints for the entry and return of all syscalls (even if the -e option is used to select only some).\
+This is invasive, and applications with high syscall rates may find their performance worsened by an order of magnitude.
+
+______________________________________________________________________
+
+Depending on application requirements, this style of tracing may be acceptable to use for short durations to determine the syscall types being called.\
+`strace(1)` would be of greater use if the overhead was not such a problem.\
+Other tracers, including `perf(1)`, `Ftrace`, `BCC`, and `bpftrace`, greatly reduce tracing overhead by using buffered tracing,\
+where events are written to a shared kernel ring buffer and the user-level tracer periodically reads the buffer.\
+This reduces context switching between user and kernel context, lowering overhead.
+
+## execsnoop
